@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables — never commit these
+.env
+.env.local
+.env.*.local
+
+# Playwright browser binaries
+.playwright/
+
+# Debug / preview outputs
+preview.json
+debug.json
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/
