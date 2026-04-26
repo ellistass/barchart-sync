@@ -42,45 +42,78 @@ function parseApiResponse(json: { data?: BarchartApiRow[] }): BarchartRow[] {
   return json.data.map(parseRow).filter(r => r.symbol)
 }
 
-// ─── Capture the first matching API response for a page load ──────────────────
+// ─── Capture rows for ONE direction from a page load ─────────────────────────
+//
+// Barchart fires BOTH desc and asc API calls on every page load.
+// We filter strictly by the orderDir we want so the two directions
+// never bleed into each other.
 
-async function capturePageData(page: Page, url: string, label: string): Promise<BarchartRow[]> {
-  return new Promise(async (resolve) => {
-    let resolved = false
-    const captured: BarchartRow[] = []
+async function captureDirection(
+  page: Page,
+  pageUrl: string,
+  wantDir: 'desc' | 'asc',
+  label: string,
+): Promise<BarchartRow[]> {
+  let rows: BarchartRow[] = []
 
-    const handler = async (response: Response) => {
-      if (!response.url().includes('/proxies/core-api/v1/quotes/get')) return
-      if (response.status() !== 200) return
+  const handler = async (response: Response) => {
+    if (!response.url().includes('/proxies/core-api/v1/quotes/get')) return
+    if (response.status() !== 200) return
+    if (rows.length > 0) return // already captured this direction
+    try {
+      const params = new URLSearchParams(new URL(response.url()).search)
+      const dir = params.get('orderDir')
+      if (dir !== wantDir) return // wrong direction — ignore
+      const json = await response.json()
+      const parsed = parseApiResponse(json)
+      if (parsed.length > 0) {
+        rows = parsed
+        console.log(`  [${label}] orderDir=${dir} rows=${rows.length}`)
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  page.on('response', handler)
+  try {
+    await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 35_000 })
+    await page.waitForTimeout(1500)
+
+    // If bearish (asc) didn't load automatically, try clicking the Bearish tab
+    if (wantDir === 'asc' && rows.length === 0) {
       try {
-        const json = await response.json()
-        const rows = parseApiResponse(json)
-        const params = new URLSearchParams(new URL(response.url()).search)
-        console.log(`  [capture:${label}] orderBy=${params.get('orderBy')} orderDir=${params.get('orderDir')} lists=${params.get('lists')} rows=${rows.length}`)
-        if (rows.length > 0 && !resolved) {
-          captured.push(...rows)
-        }
+        const bearishBtn = page.locator('text=Bearish').first()
+        await bearishBtn.click({ timeout: 5_000 })
+        await page.waitForTimeout(2000)
       } catch {
-        // ignore
+        // Tab click failed — bearish data will be empty for this run
       }
     }
+  } catch (err) {
+    console.warn(`  [${label}] Navigation warning: ${err instanceof Error ? err.message : err}`)
+  }
+  page.off('response', handler)
 
-    page.on('response', handler)
+  return rows
+}
 
-    try {
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 })
-      await page.waitForTimeout(2000)
-    } catch (err) {
-      console.warn(`  [capture:${label}] Navigation warning: ${err instanceof Error ? err.message : err}`)
-    }
+// ─── Scrape one market page (perf or surprises) → both bullish + bearish ──────
 
-    page.off('response', handler)
+async function scrapeMarketPage(
+  page: Page,
+  perfUrl: string,
+  label: string,
+): Promise<{ bullish: BarchartRow[]; bearish: BarchartRow[] }> {
+  // Navigate once for bullish (desc) — this is the default view
+  const bullish = await captureDirection(page, perfUrl, 'desc', `${label}/bull`)
 
-    if (!resolved) {
-      resolved = true
-      resolve(captured.slice(0, 10))
-    }
-  })
+  // Navigate again for bearish (asc) — separate URL triggers the asc API call
+  const bearishUrl = perfUrl.replace('orderDir=desc', 'orderDir=asc')
+  const bearish = await captureDirection(page, bearishUrl, 'asc', `${label}/bear`)
+
+  console.log(`  [${label}] final → bullish: ${bullish.length} rows, bearish: ${bearish.length} rows`)
+  return { bullish, bearish }
 }
 
 // ─── Scrape one market (forex or futures) ─────────────────────────────────────
@@ -95,42 +128,28 @@ async function scrapeMarket(
   // Futures uses a different std dev field name than forex
   const stdDevField = market === 'futures' ? 'currentStandardDeviation' : 'standardDeviation'
 
-  console.log(`\n[${market}] Fetching performance leaders — bullish…`)
-  const bullishPerf = await capturePageData(
+  console.log(`\n[${market}] Fetching performance leaders…`)
+  const perf = await scrapeMarketPage(
     page,
     `${basePerf}?viewName=main&orderBy=percentChange&orderDir=desc`,
-    `${market}/perf/bull`,
+    `${market}/perf`,
   )
 
-  console.log(`[${market}] Fetching performance leaders — bearish…`)
-  const bearishPerf = await capturePageData(
-    page,
-    `${basePerf}?viewName=main&orderBy=percentChange&orderDir=asc`,
-    `${market}/perf/bear`,
-  )
-
-  console.log(`[${market}] Fetching price surprises — bullish…`)
-  const bullishSurp = await capturePageData(
+  console.log(`[${market}] Fetching price surprises…`)
+  const surp = await scrapeMarketPage(
     page,
     `${baseSurp}?viewName=main&orderBy=${stdDevField}&orderDir=desc`,
-    `${market}/surp/bull`,
-  )
-
-  console.log(`[${market}] Fetching price surprises — bearish…`)
-  const bearishSurp = await capturePageData(
-    page,
-    `${baseSurp}?viewName=main&orderBy=${stdDevField}&orderDir=asc`,
-    `${market}/surp/bear`,
+    `${market}/surp`,
   )
 
   const performance: { today: PerformancePeriod; fiveDay: PerformancePeriod | null } = {
-    today: { bullish: bullishPerf, bearish: bearishPerf },
-    fiveDay: null, // Phase 2
+    today: { bullish: perf.bullish, bearish: perf.bearish },
+    fiveDay: null,
   }
 
   const surprises: SurprisePeriod = {
-    bullish: bullishSurp,
-    bearish: bearishSurp,
+    bullish: surp.bullish,
+    bearish: surp.bearish,
   }
 
   return { performance, surprises }
