@@ -2,10 +2,14 @@ name: Barchart Sync
 
 on:
   schedule:
-    # Monday–Friday: every hour (UTC)
-    - cron: '0 * * * 1-5'
-    # Sunday: 21:00, 22:00, 23:00 UTC = 10pm–midnight WAT (market open)
-    - cron: '0 21-23 * * 0'
+    # Monday–Friday: 10 min before every hour (data fetch)
+    - cron: '50 * * * 1-5'
+    # Monday–Friday: 5 min after every hour (safety re-fetch, confirms data is fresh)
+    - cron: '5 * * * 1-5'
+    # Sunday: 20:50, 21:50, 22:50 UTC (10 min before WAT market hours)
+    - cron: '50 20-22 * * 0'
+    # Sunday: 21:05, 22:05, 23:05 UTC (5 min after, safety re-fetch)
+    - cron: '5 21-23 * * 0'
   workflow_dispatch: # allow manual trigger from GitHub UI
 
 jobs:
